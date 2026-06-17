@@ -30,7 +30,7 @@ Trace output is separate from log output. SLS, JSONL, and HTTP receive event rec
 | Setting | Description |
 |---------|-------------|
 | `collectTrace` | Master switch for trace export. |
-| `otlpTrace.endpoint` | OTLP HTTP trace endpoint. |
+| `otlpTrace.endpoint` | OTLP HTTP base URL. Pilot auto-appends `/v1/traces` if the path does not already end with it. |
 | `otlpTrace.headers` | Headers sent to the OTLP endpoint. |
 | `otlpTrace.serviceName` | Service name attached to exported spans. |
 | `otlpTrace.resourceAttributes` | Extra OpenTelemetry resource attributes. |
@@ -74,15 +74,14 @@ Environment variables:
 
 ### Jaeger
 
-[Jaeger](https://www.jaegertracing.io/) natively supports OTLP ingestion. Use the all-in-one image for a quick local setup:
+[Jaeger](https://www.jaegertracing.io/) natively supports OTLP ingestion. Use the v2 image for a quick local setup:
 
 ```bash
 docker run -d --name jaeger \
-  -e COLLECTOR_OTLP_ENABLED=true \
   -p 16686:16686 \
   -p 4317:4317 \
   -p 4318:4318 \
-  jaegertracing/all-in-one:latest
+  jaegertracing/jaeger:2.19.0
 ```
 
 Configure Pilot:
@@ -116,32 +115,39 @@ Open [http://localhost:16686](http://localhost:16686) and select the service nam
 mkdir -p /tmp/langfuse && cd /tmp/langfuse
 curl -sLO https://raw.githubusercontent.com/langfuse/langfuse/main/docker-compose.yml
 
-cat > .env << 'EOF'
-NEXTAUTH_SECRET=your-nextauth-secret
-SALT=your-salt
-ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000
+# Generate random secrets (do NOT use placeholder values in production)
+cat > .env << EOF
+NEXTAUTH_SECRET=$(openssl rand -base64 32)
+SALT=$(openssl rand -base64 32)
+ENCRYPTION_KEY=$(openssl rand -hex 32)
 LANGFUSE_INIT_ORG_NAME=MyOrg
 LANGFUSE_INIT_PROJECT_NAME=loongsuite-pilot
 LANGFUSE_INIT_PROJECT_PUBLIC_KEY=pk-lf-my-public-key
 LANGFUSE_INIT_PROJECT_SECRET_KEY=sk-lf-my-secret-key
 LANGFUSE_INIT_USER_EMAIL=admin@example.com
 LANGFUSE_INIT_USER_NAME=admin
-LANGFUSE_INIT_USER_PASSWORD=<your-password>
+LANGFUSE_INIT_USER_PASSWORD=$(openssl rand -base64 16)
 TELEMETRY_ENABLED=false
 EOF
 
 docker compose up -d
 ```
 
+> **Security:** The `.env` file above generates cryptographically random values for secrets. Review the generated `.env` before starting the services, and note the generated password for your first login.
+
 **2. Configure Pilot:**
 
-Langfuse OTLP endpoint requires Basic authentication with `Base64(public_key:secret_key)`:
+Langfuse OTLP endpoint requires Basic authentication with `Base64(public_key:secret_key)`. Use environment variables to avoid storing credentials in config files:
 
 ```bash
-echo -n "<public_key>:<secret_key>" | base64
+LANGFUSE_AUTH=$(printf '%s' 'pk-lf-my-public-key:sk-lf-my-secret-key' | base64 | tr -d '\n')
+
+export LOONGSUITE_PILOT_COLLECT_TRACE=true
+export LOONGSUITE_PILOT_OTLP_ENDPOINT=http://localhost:3000/api/public/otel
+export LOONGSUITE_PILOT_OTLP_HEADERS="{\"Authorization\": \"Basic $LANGFUSE_AUTH\"}"
 ```
 
-Add to `~/.loongsuite-pilot/config.json`:
+Alternatively, add to `~/.loongsuite-pilot/config.json` (not recommended for shared or version-controlled environments):
 
 ```json
 {
@@ -159,7 +165,7 @@ Add to `~/.loongsuite-pilot/config.json`:
 
 Open [http://localhost:3000](http://localhost:3000) and navigate to **Traces** to view agent sessions with model name, token usage, and cost details.
 
-> **Note:** Langfuse uses HTTP for OTLP — gRPC (port 4317) is not supported. The endpoint path `/api/public/otel` is the OTLP base; Pilot auto-appends `/v1/traces`.
+> **Note:** Langfuse uses HTTP for OTLP — gRPC (port 4317) is not supported.
 
 ## Content Capture In Traces
 
