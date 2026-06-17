@@ -12,7 +12,7 @@ Trace output is separate from log output. SLS, JSONL, and HTTP receive event rec
 {
   "collectTrace": true,
   "otlpTrace": {
-    "endpoint": "https://otel-collector.example.com/v1/traces",
+    "endpoint": "https://otel-collector.example.com",
     "headers": {
       "Authorization": "Bearer token"
     },
@@ -81,8 +81,10 @@ docker run -d --name jaeger \
   -p 16686:16686 \
   -p 4317:4317 \
   -p 4318:4318 \
-  jaegertracing/jaeger:2.19.0
+  cr.jaegertracing.io/jaegertracing/jaeger:2.19.0
 ```
+
+> **Note:** Pilot uses HTTP/protobuf for OTLP export (port 4318). Port 4317 (gRPC) is exposed for other tools that may need it.
 
 Configure Pilot:
 
@@ -157,15 +159,14 @@ Alternatively, add to `~/.loongsuite-pilot/config.json` (not recommended for sha
     "headers": {
       "Authorization": "Basic <base64-encoded-credentials>"
     },
-    "serviceName": "loongsuite-pilot",
-    "captureMessageContent": true
+    "serviceName": "loongsuite-pilot"
   }
 }
 ```
 
 Open [http://localhost:3000](http://localhost:3000) and navigate to **Traces** to view agent sessions with model name, token usage, and cost details.
 
-> **Note:** Langfuse uses HTTP for OTLP — gRPC (port 4317) is not supported.
+> **Note:** Langfuse uses HTTP for OTLP — gRPC (port 4317) is not supported. To include LLM message content in traces, set `captureMessageContent` to `true` in config (default is `false`).
 
 ## Content Capture In Traces
 
