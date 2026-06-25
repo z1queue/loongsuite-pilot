@@ -149,7 +149,7 @@ export class Orchestrator extends EventEmitter {
 
     // 4. Build InputManager & AlarmManager
     const version = readInstalledVersion(this.dataDir);
-    this.alarmManager = new AlarmManager({ ip: resolveLocalIp(), version });
+    this.alarmManager = new AlarmManager({ ip: resolveLocalIp(), version, userId: this.config.userId });
 
     this.inputManager = new InputManager();
     this.inputManager.setFlusher(this.flusher);
@@ -236,8 +236,12 @@ export class Orchestrator extends EventEmitter {
       dataDir: this.dataDir,
       version,
       userId: this.config.userId,
+      canaryPolicy: this.config.autoUpdate?.canaryPolicy ?? '',
       getSnapshot: () => this.buildDataflowSnapshot(),
       alarmManager: this.alarmManager,
+      agentsConfig: this.config.agents,
+      slsEndpoints: this.config.flushers.sls?.endpoints ?? [],
+      cmsWorkspace: this.config.cms?.workspace ?? '',
     });
     await this.metricsWriter.start();
 
@@ -1101,8 +1105,6 @@ export class Orchestrator extends EventEmitter {
       inputIdleMinutes.set(id, this.inputManager.getInputIdleMinutes(id));
     }
 
-    const agentVersions = this.inputManager.getAgentVersions();
-
     return {
       sendEntriesTotal,
       receivedBytesTotal,
@@ -1111,7 +1113,6 @@ export class Orchestrator extends EventEmitter {
       flusherRunner,
       inputs,
       flushers,
-      agentVersions,
       inputIdleMinutes,
     };
   }
