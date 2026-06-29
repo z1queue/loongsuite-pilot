@@ -28,6 +28,21 @@ function eventToSubcommand(event: string): string {
 }
 
 /**
+ * On Windows, .ps1 scripts must be invoked via `powershell -File` for stdin
+ * piping to work correctly.  Bare `.ps1` paths fail to receive stdin when
+ * spawned through cmd.exe / child_process.
+ */
+function wrapPs1Command(cmd: string): string {
+  if (process.platform !== 'win32') return cmd;
+  const parts = cmd.split(' ');
+  const script = parts[0];
+  if (!script.endsWith('.ps1')) return cmd;
+  const args = parts.slice(1).join(' ');
+  const wrapped = `powershell -NoProfile -ExecutionPolicy Bypass -File ${script}`;
+  return args ? `${wrapped} ${args}` : wrapped;
+}
+
+/**
  * 拼 hooks.json 中实际写入的 command 字符串。
  * 必须与 codex trust hash 算用的字符串完全一致。
  */
@@ -36,10 +51,11 @@ function formatHookCommand(
   event: string,
   style: AgentHookConfig['eventSubcommand'],
 ): string {
+  const cmd = wrapPs1Command(hookCommand);
   if (style === 'kebab-case') {
-    return `${hookCommand} ${eventToSubcommand(event)}`;
+    return `${cmd} ${eventToSubcommand(event)}`;
   }
-  return hookCommand;
+  return cmd;
 }
 
 export class HookStrategy implements DeployStrategy {
@@ -54,13 +70,33 @@ export class HookStrategy implements DeployStrategy {
   }
 
   async needsDeploy(def: AgentDefinition, _record?: DeployedAgentRecord): Promise<boolean> {
+    if (await this.needsSettingsRepairForCodex(def)) {
+      return true;
+    }
+
     const hookDefs = this.buildHookDefinitions(def);
     for (const hookDef of hookDefs) {
       if (!(await this.hookManager.isHookInstalled(hookDef))) {
         return true;
       }
     }
+    for (const retiredDef of this.buildRetiredHookDefinitions(def)) {
+      if (await this.hookManager.isHookInstalled(retiredDef)) {
+        return true;
+      }
+    }
     return false;
+  }
+
+  private async needsSettingsRepairForCodex(def: AgentDefinition): Promise<boolean> {
+    const settingsPath = def.hook?.settingsPath;
+    if (!settingsPath) return false;
+
+    const isCodexHooksJson = settingsPath.endsWith('hooks.json') && settingsPath.includes('.codex');
+    if (!isCodexHooksJson) return false;
+
+    const existing = await readJsonFile<Record<string, unknown>>(settingsPath);
+    return existing?.version !== undefined;
   }
 
   async deploy(def: AgentDefinition): Promise<DeployResult> {
@@ -71,6 +107,36 @@ export class HookStrategy implements DeployStrategy {
 
     try {
       await this.ensureSettingsFile(hookConfig.settingsPath);
+
+      const retiredHookDefs = this.buildRetiredHookDefinitions(def);
+      for (const retiredHookDef of retiredHookDefs) {
+        const removed = await this.hookManager.uninstallHook(retiredHookDef);
+        if (!removed) {
+          return { success: false, agentId: def.id, deployMode: 'hook', error: 'failed to remove retired hook event' };
+        }
+      }
+      if (hookConfig.trustToml && retiredHookDefs.length > 0) {
+        const trust = hookConfig.trustToml;
+        removeTrustBlock(
+          resolveHome(trust.configPath),
+          trust.marker,
+          path.resolve(resolveHome(hookConfig.settingsPath)),
+          retiredHookDefs.map(definition => definition.hookJsonPath.at(-1)!),
+        );
+      }
+
+      if (hookConfig.env) {
+        try {
+          await this.applyEnvToSettings(hookConfig.settingsPath, hookConfig.env);
+        } catch (err) {
+          // env injection failure must not block hook deployment — pilot can still
+          // collect the basic transcript-based events without preload.
+          logger.warn('settings.env merge failed (non-blocking)', {
+            agentId: def.id,
+            error: String(err),
+          });
+        }
+      }
 
       const hookDefs = this.buildHookDefinitions(def);
       for (const hookDef of hookDefs) {
@@ -250,25 +316,115 @@ export class HookStrategy implements DeployStrategy {
       agentId: def.id,
       settingsPath: hookConfig.settingsPath,
       hookJsonPath: ['hooks', event],
-      hookCommand: formatHookCommand(hookConfig.hookCommand, event, hookConfig.eventSubcommand),
+      hookCommand: formatHookCommand(
+        hookConfig.hookCommand, event, hookConfig.eventSubcommand,
+      ),
       matcher: hookConfig.matcher,
       useNestedFormat: hookConfig.format === 'nested',
       replaceHookCommands: hookConfig.replaceHookCommands,
     }));
   }
 
+  private buildRetiredHookDefinitions(def: AgentDefinition): HookDefinition[] {
+    const hookConfig = def.hook;
+    if (!hookConfig?.retiredEvents?.length) return [];
+    const currentEvents = new Set(hookConfig.events);
+    return [...new Set(hookConfig.retiredEvents)]
+      .filter(event => !currentEvents.has(event))
+      .map(event => ({
+        agentId: def.id,
+        settingsPath: hookConfig.settingsPath,
+        hookJsonPath: ['hooks', event],
+        hookCommand: formatHookCommand(
+          hookConfig.hookCommand, event, hookConfig.eventSubcommand,
+        ),
+        matcher: hookConfig.matcher,
+        useNestedFormat: hookConfig.format === 'nested',
+        replaceHookCommands: hookConfig.replaceHookCommands,
+      }));
+  }
+
+  /**
+   * Merge env entries from the agent hook config into the settings file's
+   * top-level `env` block. Supports `$PILOT_DATA` token expansion.
+   *
+   * Idempotency:
+   *   - Regular keys overwrite if already present.
+   *   - `BUN_OPTIONS` is treated as a space-separated flag list. If the
+   *     existing value already contains the same `--preload=<path>` we are
+   *     about to add, the write is skipped (allows coexistence with user's
+   *     own preload scripts).
+   *
+   * Failure here is non-fatal — caller in deploy() wraps in try/catch.
+   */
+  private async applyEnvToSettings(
+    settingsPath: string,
+    env: Record<string, string>,
+  ): Promise<void> {
+    // NOTE: $PILOT_DATA tokens in `env` values are already resolved by
+    // AgentDefLoader.resolveVariables() before the config reaches here
+    // (see agent-def-loader.ts), so no further expansion is needed.
+    const existing =
+      (await readJsonFile<Record<string, unknown>>(settingsPath)) ?? {};
+    const envBlock =
+      (existing.env as Record<string, string> | undefined) ?? {};
+    let changed = false;
+
+    for (const [key, value] of Object.entries(env)) {
+      if (key === 'BUN_OPTIONS') {
+        const current = envBlock[key];
+        if (typeof current === 'string' && current.length > 0) {
+          // Match against full whitespace-delimited tokens to avoid a
+          // superstring false-positive (e.g., `...intercept.mjs-debug`
+          // would otherwise be treated as already containing our path).
+          const ourTokens = value.split(/\s+/).filter(Boolean);
+          const currentTokens = current.split(/\s+/).filter(Boolean);
+          if (ourTokens.every((t) => currentTokens.includes(t))) {
+            continue; // already injected (exact tokens present)
+          }
+          envBlock[key] = `${current} ${value}`.trim();
+          changed = true;
+          continue;
+        }
+      }
+
+      if (envBlock[key] !== value) {
+        envBlock[key] = value;
+        changed = true;
+      }
+    }
+
+    if (!changed) return;
+    existing.env = envBlock;
+    await writeJsonFile(settingsPath, existing);
+    logger.info('settings.env merged', { settingsPath, keys: Object.keys(env) });
+  }
+
   /**
    * Ensure the settings file exists with a valid structure.
-   * Handles Cursor's hooks.json which needs a `version` field.
+   * Cursor's hooks.json requires a `version` field; Codex's does NOT
+   * (Codex uses `#[serde(deny_unknown_fields)]` and only allows `hooks`).
    */
   private async ensureSettingsFile(settingsPath: string): Promise<void> {
+    const isHooksJson = settingsPath.endsWith('hooks.json');
+    const needsVersion = isHooksJson && settingsPath.includes('.cursor');
+
     const existing = await readJsonFile<Record<string, unknown>>(settingsPath);
     if (!existing) {
-      if (settingsPath.endsWith('hooks.json')) {
-        await writeJsonFile(settingsPath, { version: 1, hooks: {} });
+      if (isHooksJson) {
+        const initial: Record<string, unknown> = { hooks: {} };
+        if (needsVersion) {
+          initial.version = 1;
+        }
+        await writeJsonFile(settingsPath, initial);
       }
-    } else if (settingsPath.endsWith('hooks.json') && existing.version === undefined) {
+    } else if (needsVersion && existing.version === undefined) {
       existing.version = 1;
+      await writeJsonFile(settingsPath, existing);
+    } else if (isHooksJson && settingsPath.includes('.codex') && existing.version !== undefined) {
+      // Clean up stale `version` field previously injected by older pilot versions.
+      // Codex uses #[serde(deny_unknown_fields)] and rejects any key other than `hooks`.
+      delete existing.version;
       await writeJsonFile(settingsPath, existing);
     }
   }

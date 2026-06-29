@@ -4,7 +4,7 @@
 
 // ─── Deploy Mode ───
 
-export type DeployMode = 'hook' | 'plugin-probe' | 'plugin-inject';
+export type DeployMode = 'hook' | 'plugin-probe' | 'plugin-inject' | 'detection-only';
 export type MountType = 'wrapper' | 'rc-inject' | 'env-inject';
 export type HookFormat = 'flat' | 'nested';
 export type PluginSourceType = 'oss' | 'tar';
@@ -38,6 +38,8 @@ export interface AgentHookConfig {
   format: HookFormat;
   matcher?: string;
   replaceHookCommands?: string[];
+  /** Events previously owned by this hook that must be removed during deploy. */
+  retiredEvents?: string[];
   /**
    * 可选的 trust TOML 配置。仅 Codex 等需要 trust hash 校验的 agent 填写。
    * 设置后，HookStrategy 在 deploy 时会调用 codex-trust-writer 写入对应 TOML 文件。
@@ -52,6 +54,35 @@ export interface AgentHookConfig {
    * trust hash 也用同样字符串，保证一致性。
    */
   eventSubcommand?: 'kebab-case';
+  /**
+   * If true, omit quotes around the -File path on Windows.
+   * Use for agents whose hook executor does direct spawn (not shell),
+   * where the quoted path in -File "..." would become literal characters.
+   */
+  rawCommand?: boolean;
+  /**
+   * Optional env block to merge into the agent's settings.json on deploy.
+   *
+   * Each value may contain the `$PILOT_DATA` token; AgentDefLoader resolves
+   * it (recursively, honoring `LOONGSUITE_PILOT_DATA_DIR`) when loading the
+   * agent definition, so HookStrategy receives already-expanded strings.
+   *
+   * Merge semantics:
+   *   - Regular keys: overwrite if present
+   *   - `BUN_OPTIONS` is treated as space-separated flags; if every token
+   *     we would add is already present, the write is skipped to keep
+   *     deploy idempotent and to coexist with other preload scripts the
+   *     user may have configured.
+   *
+   * NOTE: settings.json env is read AFTER the agent's main process starts,
+   * so it can only affect child processes the agent spawns. It cannot
+   * influence runtime flags that the host process itself consumes at
+   * startup — most notably `BUN_OPTIONS` for Bun-compiled binaries, which
+   * Bun reads before any JS executes. For BUN_OPTIONS-style injections,
+   * use a shell-rc wrapper instead (see installer-opensource.sh
+   * inject_claude_code_fetch_intercept).
+   */
+  env?: Record<string, string>;
 }
 
 export interface PluginSourceConfig {
@@ -91,6 +122,8 @@ export interface AgentDefinition {
   displayName: string;
   deployMode: DeployMode;
   detection: AgentDetectionConfig;
+  /** Runtime id used by local worker activation, e.g. "claude-code". */
+  localWorkerRuntime?: string;
   hook?: AgentHookConfig;
   pluginProbe?: PluginProbeConfig;
   pluginInject?: PluginInjectConfig;

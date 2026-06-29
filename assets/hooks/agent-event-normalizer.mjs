@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isQoderIdeaSession } from './shared/qoder-db-utils.mjs';
 
 const MESSAGE_CONTENT_FIELDS = new Set([
   'gen_ai.input.messages',
@@ -279,6 +280,7 @@ const AGENT_TYPE_TO_CONFIG_KEY = {
   'qoder-cn': 'qoder-cn',
   'qoder-cn-hook': 'qoder-cn',
   'cursor-hook': 'cursor',
+  'cursor-cli': 'cursor',
 };
 
 export function applyHookContentPolicy(record, runtimeConfig = {}) {
@@ -343,7 +345,7 @@ export function getSourceHookEvent(payload) {
 export function mapSourceHookEventToEventName(sourceEvent) {
   const event = String(sourceEvent || '').toLowerCase();
   if (event.includes('agentresponse') || event.includes('agentthought')) return 'llm.response';
-  if (event.includes('beforesubmitprompt')) return 'llm.request';
+  if (event.includes('beforesubmitprompt')) return 'other';
   if (event.includes('pretooluse') || event.includes('beforemcpexecution') || event.includes('beforeshellexecution')) return 'tool.call';
   if (
     event.includes('posttooluse') ||
@@ -356,12 +358,26 @@ export function mapSourceHookEventToEventName(sourceEvent) {
   return 'other';
 }
 
+const DEFAULT_CURSOR_MODEL = 'composer-2.5';
+
+/** Coerce raw model string to a concrete model name. */
+export function resolveCursorModel(rawModel) {
+  if (!rawModel || rawModel === 'default' || rawModel === 'unknown') return DEFAULT_CURSOR_MODEL;
+  return rawModel;
+}
+
+/** Whether this event type carries user input messages (prompt). */
+export function hasInputMessages(eventName) {
+  return eventName === 'llm.request' || eventName === 'other';
+}
+
 export function buildCursorHookRecord(payload, options = {}) {
   const now = options.now || new Date();
   const runtimeConfig = options.runtimeConfig || {};
   const sourceEvent = getSourceHookEvent(payload);
   const eventName = getStringValue(payload, 'event.name') || mapSourceHookEventToEventName(sourceEvent);
-  const model = getStringValue(payload, 'model') || 'unknown';
+  const rawModel = getStringValue(payload, 'model') || 'unknown';
+  const model = resolveCursorModel(rawModel);
   const toolOutput = parseMaybeJson(payload.tool_output ?? payload.result_json ?? payload.tool_results);
   const toolArguments = parseMaybeJson(payload.tool_input);
   // Stop events duplicate token/cost data already reported by afterAgentResponse
@@ -381,7 +397,7 @@ export function buildCursorHookRecord(payload, options = {}) {
       || getStringValue(payload, 'turn.id'),
     'gen_ai.step.id': getStringValue(payload, 'gen_ai.step.id') || getStringValue(payload, 'step_id'),
     'gen_ai.agent.type': 'cursor',
-    'gen_ai.provider.name': inferProviderName({ ...payload, 'gen_ai.request.model': model, 'gen_ai.agent.type': 'cursor' }),
+    'gen_ai.provider.name': /^composer/i.test(model) ? 'cursor' : inferProviderName({ ...payload, 'gen_ai.request.model': model, 'gen_ai.agent.type': 'cursor' }),
     'gen_ai.request.model': getStringValue(payload, 'gen_ai.request.model') || model,
     'gen_ai.response.model': getStringValue(payload, 'gen_ai.response.model') || model,
     'gen_ai.response.finish_reasons': getStringValue(payload, 'response_finish_reasons'),
@@ -397,8 +413,8 @@ export function buildCursorHookRecord(payload, options = {}) {
     'gen_ai.usage.cache_creation.input_cost': isStopEvent ? undefined : getNumberValue(payload, 'cost_cache_write'),
     'gen_ai.usage.total_cost': isStopEvent ? undefined : getNumberValue(payload, 'cost_total'),
     'gen_ai.input.messages_hash': getStringValue(payload, 'input_messages_hash'),
-    'gen_ai.input.messages_delta': eventName === 'llm.request' ? buildCursorInputMessagesDelta(payload) : undefined,
-    'gen_ai.input.messages': eventName === 'llm.request' ? toJsonValue(parseMaybeJson(payload.input_messages)) : undefined,
+    'gen_ai.input.messages_delta': hasInputMessages(eventName) ? buildCursorInputMessagesDelta(payload) : undefined,
+    'gen_ai.input.messages': hasInputMessages(eventName) ? toJsonValue(parseMaybeJson(payload.input_messages)) : undefined,
     'gen_ai.output.messages': eventName === 'llm.response' ? buildCursorOutputMessages(payload, sourceEvent) : undefined,
     'gen_ai.tool.name': getStringValue(payload, 'tool_name'),
     'gen_ai.tool.call.id': getStringValue(payload, 'tool_use_id'),
@@ -431,7 +447,7 @@ export function buildQoderHookRecord(row, options = {}) {
   const content = selectDominantContentBlock(message.content);
   if (!content) return null;
 
-  const variant = inferQoderVariant(row, sourceAgentId);
+  const variant = inferQoderVariant(row, sourceAgentId, options.sessionId);
   const sourceNamespace = qoderSourceNamespace(variant);
   const eventName = inferQoderEventName(rowType, content);
   const model = rowType === 'user' ? undefined : (getStringValue(message, 'model') || 'unknown');
@@ -456,7 +472,9 @@ export function buildQoderHookRecord(row, options = {}) {
     'gen_ai.response.model': model,
     'gen_ai.response.id': eventName === 'llm.response' ? getStringValue(message, 'id') : undefined,
     'gen_ai.response.finish_reasons': getStringValue(message, 'stop_reason'),
-    'gen_ai.input.messages_delta': eventName === 'llm.request' ? buildQoderInputMessagesDelta(content) : undefined,
+    'gen_ai.input.messages_delta': eventName === 'llm.request' || (eventName === 'other' && rowType === 'user')
+      ? buildQoderInputMessagesDelta(content)
+      : undefined,
     'gen_ai.output.messages': eventName === 'llm.response' ? buildQoderOutputMessages(content) : undefined,
     'gen_ai.tool.name': eventName === 'tool.call' ? getStringValue(content, 'name') : undefined,
     'gen_ai.tool.call.id': eventName === 'tool.call' || eventName === 'tool.result' ? toolCallId : undefined,
@@ -523,6 +541,7 @@ function buildQoderPostToolUseRecord(row, runtimeConfig, sourceAgentId, turnId) 
 function qoderSourceNamespace(variant) {
   if (variant === 'qoder-work') return 'qoderwork';
   if (variant === 'qoder-cn') return 'qodercn';
+  if (variant === 'qoder-idea') return 'qoderidea';
   return 'qoder';
 }
 
@@ -579,22 +598,31 @@ function asRecord(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
-function inferQoderVariant(row, sourceAgentId) {
+function inferQoderVariant(row, sourceAgentId, sessionId) {
   if (sourceAgentId === 'qoder-work') return 'qoder-work';
   if (sourceAgentId === 'qoder-cn') return 'qoder-cn';
-  return getStringValue(row, 'entrypoint') === 'cli'
+  if (
+    getStringValue(row, 'entrypoint') === 'cli'
     || row.promptId !== undefined
     || row.permissionMode !== undefined
     || row.userType !== undefined
-    ? 'qoder-cli'
-    : 'qoder';
+  ) {
+    return 'qoder-cli';
+  }
+  // DB-based detection via shared helper
+  if (sessionId) {
+    const result = isQoderIdeaSession(sessionId);
+    if (result === true) return 'qoder-idea';
+    if (result === false) return 'qoder';
+  }
+  return 'qoder';
 }
 
 function inferQoderEventName(rowType, content) {
   const contentType = getStringValue(content, 'type');
   if (contentType === 'tool_result') return 'tool.result';
   if (contentType === 'tool_use') return 'tool.call';
-  return rowType === 'assistant' ? 'llm.response' : 'llm.request';
+  return rowType === 'assistant' ? 'llm.response' : 'other';
 }
 
 function selectDominantContentBlock(rawContent) {

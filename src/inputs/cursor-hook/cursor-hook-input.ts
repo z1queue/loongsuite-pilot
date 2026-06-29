@@ -15,6 +15,18 @@ import { inferGitContext, BoundedTtlCache } from '../../utils/git-context.js';
 import { buildCanonicalHookEntry } from '../base/canonical-hook-record.js';
 
 const UNKNOWN_MODEL = 'unknown';
+const DEFAULT_CURSOR_MODEL = 'composer-2.5';
+
+/** Coerce raw model string to a concrete model name. */
+function resolveCursorModel(rawModel: string): string {
+  if (!rawModel || rawModel === 'default' || rawModel === 'unknown') return DEFAULT_CURSOR_MODEL;
+  return rawModel;
+}
+
+/** Whether this event type carries user input messages (prompt). */
+function hasInputMessages(eventName: string): boolean {
+  return eventName === 'llm.request' || eventName === 'other';
+}
 
 const SESSION_CD_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -24,6 +36,16 @@ interface SessionCdCacheEntry {
 }
 
 const sessionCdCache = new BoundedTtlCache<SessionCdCacheEntry>();
+
+const CLI_VERSION_PATTERN = /^\d{4}\.\d{2}\.\d{2}/;
+
+function inferCursorVariant(record: Record<string, unknown>): ClientType.Cursor | ClientType.CursorCli {
+  const explicitType = record['gen_ai.agent.type'];
+  if (explicitType === 'cursor-cli') return ClientType.CursorCli;
+  const version = record['agent.cursor.cursor_version'] ?? record['cursor_version'];
+  if (typeof version === 'string' && CLI_VERSION_PATTERN.test(version)) return ClientType.CursorCli;
+  return ClientType.Cursor;
+}
 
 function getStringValue(data: Record<string, unknown>, key: string): string | undefined {
   const val = data[key];
@@ -72,10 +94,15 @@ export class CursorHookInput extends BaseHookInput {
       buildAttributes(record, payload, hookEvent),
     );
     if (canonicalEntry) {
+      const variant = inferCursorVariant(record);
+      if (variant === ClientType.CursorCli) {
+        canonicalEntry['gen_ai.agent.type'] = ClientType.CursorCli;
+      }
       if (hookEvent.toLowerCase() === 'stop') {
         stripTokenFields(canonicalEntry);
       }
-      await enrichCanonicalEntryWithGit(canonicalEntry, record, 'cursor');
+      const gitNamespace = variant === ClientType.CursorCli ? 'cursor_cli' : 'cursor';
+      await enrichCanonicalEntryWithGit(canonicalEntry, record, gitNamespace);
       return canonicalEntry;
     }
 
@@ -84,7 +111,9 @@ export class CursorHookInput extends BaseHookInput {
     const toolOutput = buildToolResultPayload(payload);
     const toolArguments = buildToolArguments(payload);
     const attributes = buildAttributes(record, payload, hookEvent);
-    const model = getStringValue(payload, 'model') ?? UNKNOWN_MODEL;
+    const rawModel = getStringValue(payload, 'model') || UNKNOWN_MODEL;
+    const model = resolveCursorModel(rawModel);
+    const variant = inferCursorVariant(record);
     const sessionId = getStringValue(payload, 'session_id')
       ?? getStringValue(payload, 'conversation_id')
       ?? getStringValue(payload, 'session.id')
@@ -128,7 +157,7 @@ export class CursorHookInput extends BaseHookInput {
       'gen_ai.turn.id': getStringValue(payload, 'gen_ai.turn.id')
         ?? getStringValue(payload, 'generation_id')
         ?? getStringValue(payload, 'turn.id'),
-      'gen_ai.agent.type': ClientType.Cursor,
+      'gen_ai.agent.type': variant,
       'gen_ai.request.model': model,
       'gen_ai.response.model': model,
       'gen_ai.response.finish_reasons': normalizeFinishReasons(getStringValue(payload, 'response_finish_reasons')),
@@ -146,8 +175,8 @@ export class CursorHookInput extends BaseHookInput {
       'gen_ai.usage.cache_creation.input_cost': isStopEvent ? undefined : getNumberValue(payload, 'cost_cache_write'),
       'gen_ai.usage.total_cost': isStopEvent ? undefined : getNumberValue(payload, 'cost_total'),
       'gen_ai.input.messages_hash': getStringValue(payload, 'input_messages_hash'),
-      'gen_ai.input.messages_delta': eventName === 'llm.request' ? buildInputMessagesDelta(payload) : undefined,
-      'gen_ai.input.messages': eventName === 'llm.request' ? toJsonValue(parseMaybeJson(payload.input_messages)) : undefined,
+      'gen_ai.input.messages_delta': hasInputMessages(eventName) ? buildInputMessagesDelta(payload) : undefined,
+      'gen_ai.input.messages': hasInputMessages(eventName) ? toJsonValue(parseMaybeJson(payload.input_messages)) : undefined,
       'gen_ai.tool.name': getStringValue(payload, 'tool_name'),
       'gen_ai.tool.call.id': getStringValue(payload, 'tool_use_id'),
       'gen_ai.tool.call.exec.id': getStringValue(payload, 'tool_use_id'),
@@ -188,7 +217,7 @@ function inferEventName(hookEvent: string, payload: Record<string, unknown>): Ag
     return 'llm.response';
   }
   if (event.includes('beforesubmitprompt')) {
-    return 'llm.request';
+    return 'other';
   }
   if (event.includes('pretooluse')) {
     return 'tool.call';

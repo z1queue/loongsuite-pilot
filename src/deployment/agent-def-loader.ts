@@ -90,7 +90,7 @@ export class AgentDefLoader {
       }
     }
     const mode = obj.deployMode;
-    if (mode !== 'hook' && mode !== 'plugin-probe' && mode !== 'plugin-inject') {
+    if (mode !== 'hook' && mode !== 'plugin-probe' && mode !== 'plugin-inject' && mode !== 'detection-only') {
       logger.warn('invalid agent definition: unknown deployMode', { file: filePath, deployMode: mode });
       return false;
     }
@@ -124,6 +124,11 @@ export class AgentDefLoader {
       .replace(/\$PILOT_DATA/g, this.dataDir);
 
     result = resolveHome(result);
+
+    if (process.platform === 'win32') {
+      result = result.replace(/\\/g, '/');
+      result = result.replace(/\.sh(?=\s|$)/, '.ps1');
+    }
     return result;
   }
 }

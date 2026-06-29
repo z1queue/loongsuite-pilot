@@ -6,11 +6,13 @@ import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import * as crypto from 'node:crypto';
+import * as os from 'node:os';
 import type { AutoUpdateConfig } from '../types/index.js';
 import { createLogger } from '../utils/logger.js';
 import { readJsonFile, writeJsonFile, resolveHome } from '../utils/fs-utils.js';
 import { compareVersions, computeSha256, deterministicBucket } from './version-utils.js';
 import type { UpdaterMetrics } from './updater-metrics.js';
+import { updaterRuntimePath, type UpdaterRuntimeState } from './runtime-state.js';
 
 const execFileAsync = promisify(execFile);
 const logger = createLogger('Updater');
@@ -64,17 +66,31 @@ export interface UpdaterPaths {
   previousFile: string;
   bootstrapDir: string;
   loongsuitePilotBin: string;
+  runtimeFile: string;
+}
+
+function homeDir(): string {
+  return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
+}
+
+function pilotBinPath(): string {
+  const home = homeDir();
+  const ext = process.platform === 'win32' ? '.ps1' : '';
+  return path.join(home, '.local', 'bin', `loongsuite-pilot${ext}`);
 }
 
 function defaultPaths(): UpdaterPaths {
-  const cacheDir = path.join(process.env.HOME ?? '', '.loongsuite-pilot');
+  const home = homeDir();
+  const cacheDir = path.join(home, '.loongsuite-pilot');
+  const dataDir = resolveHome(process.env.LOONGSUITE_PILOT_DATA_DIR ?? cacheDir);
   return {
     cacheDir,
     versionsDir: path.join(cacheDir, 'versions'),
     currentFile: path.join(cacheDir, 'current'),
     previousFile: path.join(cacheDir, 'previous'),
     bootstrapDir: path.join(cacheDir, 'bin'),
-    loongsuitePilotBin: path.join(process.env.HOME ?? '', '.local', 'bin', 'loongsuite-pilot'),
+    loongsuitePilotBin: pilotBinPath(),
+    runtimeFile: updaterRuntimePath(dataDir),
   };
 }
 
@@ -85,7 +101,8 @@ export function buildPaths(baseDir: string): UpdaterPaths {
     currentFile: path.join(baseDir, 'current'),
     previousFile: path.join(baseDir, 'previous'),
     bootstrapDir: path.join(baseDir, 'bin'),
-    loongsuitePilotBin: path.join(process.env.HOME ?? '', '.local', 'bin', 'loongsuite-pilot'),
+    loongsuitePilotBin: pilotBinPath(),
+    runtimeFile: updaterRuntimePath(baseDir),
   };
 }
 
@@ -99,6 +116,7 @@ const DEFAULT_CONFIG_PATH = '~/.loongsuite-pilot/config.json';
 
 export class Updater {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private checking = false;
   private consecutiveFailures = 0;
   private nextCheckAt = 0;
@@ -131,6 +149,9 @@ export class Updater {
       manifestUrl: this.config.manifestUrl,
     });
     void this.metrics?.writeEvent('updater_started');
+    void this.writeHeartbeat();
+    this.heartbeatTimer = setInterval(() => void this.writeHeartbeat(), 30_000);
+    this.heartbeatTimer.unref();
 
     setTimeout(() => void this.check(), 60_000);
 
@@ -144,6 +165,10 @@ export class Updater {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
     logger.info('updater stopped');
     void this.metrics?.writeEvent('updater_stopped');
@@ -176,6 +201,8 @@ export class Updater {
           channel,
         });
         this.consecutiveFailures = 0;
+        this.nextCheckAt = 0;
+        await this.writeHeartbeat();
         return;
       }
 
@@ -215,8 +242,9 @@ export class Updater {
       });
 
       await this.restartMonitorIfRunning();
-      await this.gcOldVersions();
       this.consecutiveFailures = 0;
+      this.nextCheckAt = 0;
+      await this.writeHeartbeat();
     } catch (err) {
       this.consecutiveFailures++;
       const backoffMs = Math.min(
@@ -240,13 +268,13 @@ export class Updater {
       );
 
       if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        logger.error('too many consecutive failures, stopping updater');
+        logger.error('too many consecutive failures, updater entering degraded retry');
         void this.metrics?.writeEvent('updater_stopped_max_failures', {
-          error: `${MAX_CONSECUTIVE_FAILURES} consecutive failures`,
+          error: `${MAX_CONSECUTIVE_FAILURES} consecutive failures; degraded retry continues`,
           consecutive_failures: this.consecutiveFailures,
         });
-        this.stop();
       }
+      await this.writeHeartbeat();
     } finally {
       this.checking = false;
     }
@@ -417,9 +445,14 @@ export class Updater {
     const tarball = path.join(tmpDir, 'package.tar.gz');
     const dirName = `${manifest.version}_${manifest.git_commit}`;
     const targetDir = path.join(versionsDir, dirName);
+    const stagingDir = path.join(versionsDir, `${dirName}.candidate`);
+    let activated = false;
+    let oldCurrent: string | null = null;
+    let oldPrevious: string | null = null;
 
     try {
       await fs.rm(tmpDir, { recursive: true, force: true });
+      await fs.rm(stagingDir, { recursive: true, force: true });
       await fs.mkdir(tmpDir, { recursive: true });
 
       logger.info('downloading update', { url: packageUrl });
@@ -466,23 +499,23 @@ export class Updater {
       }
 
       await fs.mkdir(versionsDir, { recursive: true });
-      await fs.rm(targetDir, { recursive: true, force: true });
-      await fs.cp(extractedDir, targetDir, { recursive: true });
+      await fs.cp(extractedDir, stagingDir, { recursive: true });
 
       const childEnv = buildChildEnv();
 
       logger.info('running npm install', { PATH: childEnv.PATH });
       await execFileAsync('npm', ['install', '--production', '--no-optional'], {
-        cwd: targetDir,
+        cwd: stagingDir,
         env: childEnv,
         timeout: NPM_INSTALL_TIMEOUT_MS,
+        shell: process.platform === 'win32',
       });
 
-      const postinstallScript = path.join(targetDir, 'scripts', 'postinstall.js');
+      const postinstallScript = path.join(stagingDir, 'scripts', 'postinstall.js');
       if (await fs.access(postinstallScript).then(() => true).catch(() => false)) {
         try {
           await execFileAsync(process.execPath, [postinstallScript], {
-            cwd: targetDir,
+            cwd: stagingDir,
             env: childEnv,
             timeout: 30_000,
           });
@@ -492,16 +525,20 @@ export class Updater {
       }
 
       const { currentFile, previousFile } = this.paths;
-      const oldCurrent = await this.readPointerFile(currentFile);
-      const oldPrevious = await this.readPointerFile(previousFile);
+      oldCurrent = await this.readPointerFile(currentFile);
+      oldPrevious = await this.readPointerFile(previousFile);
 
       try {
+        await fs.rm(targetDir, { recursive: true, force: true });
+        await fs.rename(stagingDir, targetDir);
+
         if (oldCurrent && oldCurrent !== dirName) {
           await this.writePointerFile(previousFile, oldCurrent);
         }
 
         await this.writePointerFile(currentFile, dirName);
         await this.syncInstalledScripts(targetDir);
+        activated = true;
       } catch (err) {
         logger.warn('failed to finalize update, restoring previous installation', { error: String(err) });
         await this.restorePointers(oldCurrent, oldPrevious);
@@ -516,6 +553,9 @@ export class Updater {
       logger.info('update deployed', { version: manifest.version, dir: dirName });
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      if (!activated) {
+        await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+      }
     }
   }
 
@@ -535,6 +575,43 @@ export class Updater {
     return hasRoot ? dir : null;
   }
 
+  private async writeHeartbeat(): Promise<void> {
+    if (!this.config.enabled) return;
+
+    try {
+      const currentName = await this.readPointerFile(this.paths.currentFile);
+      let local: LocalVersion | null = null;
+      if (currentName) {
+        const versionFile = path.join(this.paths.versionsDir, currentName, 'VERSION');
+        try {
+          const content = await fs.readFile(versionFile, 'utf-8');
+          const version = content.match(/^version=(.+)$/m)?.[1] ?? 'unknown';
+          const gitCommit = content.match(/^git_commit=(.+)$/m)?.[1] ?? '';
+          local = { version, gitCommit };
+        } catch {
+          local = null;
+        }
+      }
+
+      const state: UpdaterRuntimeState = {
+        status: this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? 'degraded' : 'running',
+        pid: process.pid,
+        version: local?.version ?? 'unknown',
+        versionDir: currentName,
+        updatedAt: new Date().toISOString(),
+        consecutiveFailures: this.consecutiveFailures,
+      };
+      if (local?.gitCommit) state.gitCommit = local.gitCommit;
+      if (this.nextCheckAt > 0) {
+        state.nextCheckAt = new Date(this.nextCheckAt).toISOString();
+      }
+
+      await writeJsonFile(this.paths.runtimeFile, state);
+    } catch (err) {
+      logger.warn('failed to write updater heartbeat', { error: String(err) });
+    }
+  }
+
   private async syncInstalledScripts(versionDir: string): Promise<void> {
     const { bootstrapDir, loongsuitePilotBin } = this.paths;
     const srcDir = path.join(versionDir, 'scripts');
@@ -546,7 +623,8 @@ export class Updater {
       await this.copyFileAtomic(src, dst);
     }
 
-    const cliScript = path.join(srcDir, 'loongsuite-pilot.sh');
+    const cliExt = process.platform === 'win32' ? '.ps1' : '.sh';
+    const cliScript = path.join(srcDir, `loongsuite-pilot${cliExt}`);
     await fs.mkdir(path.dirname(loongsuitePilotBin), { recursive: true });
     await this.copyFileAtomic(cliScript, loongsuitePilotBin, 0o755);
 
@@ -604,7 +682,14 @@ export class Updater {
   private async restartCollector(): Promise<void> {
     logger.info('restarting collector service');
     try {
-      await execFileAsync(this.paths.loongsuitePilotBin, ['restart-collector'], { timeout: 30_000 });
+      const bin = this.paths.loongsuitePilotBin;
+      if (process.platform === 'win32') {
+        await execFileAsync('powershell.exe', [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', bin, 'restart-collector',
+        ], { timeout: 30_000 });
+      } else {
+        await execFileAsync(bin, ['restart-collector'], { timeout: 30_000 });
+      }
       logger.info('collector restarted');
     } catch (err) {
       logger.warn('collector restart failed', { error: String(err) });
@@ -621,8 +706,18 @@ export class Updater {
 
     logger.info('restarting monitor after update');
     try {
-      await execFileAsync(this.paths.loongsuitePilotBin, ['monitor', 'stop'], { timeout: 30_000 });
-      await execFileAsync(this.paths.loongsuitePilotBin, ['monitor', 'start'], { timeout: 30_000 });
+      const bin = this.paths.loongsuitePilotBin;
+      if (process.platform === 'win32') {
+        await execFileAsync('powershell.exe', [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', bin, 'monitor', 'stop',
+        ], { timeout: 30_000 });
+        await execFileAsync('powershell.exe', [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', bin, 'monitor', 'start',
+        ], { timeout: 30_000 });
+      } else {
+        await execFileAsync(bin, ['monitor', 'stop'], { timeout: 30_000 });
+        await execFileAsync(bin, ['monitor', 'start'], { timeout: 30_000 });
+      }
       logger.info('monitor restarted');
     } catch (err) {
       logger.warn('monitor restart failed', { error: String(err) });
