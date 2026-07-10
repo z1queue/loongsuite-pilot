@@ -8,8 +8,11 @@ import { ClientType, CollectionMethod } from '../../types/index.js';
 import type { AgentActivityEntry } from '../../types/index.js';
 import { buildAgentActivityEntry, toJsonValue } from '../../normalization/entry-builder.js';
 import { BaseInput, type InputOptions } from '../base/base-input.js';
+import { createLogger } from '../../utils/logger.js';
 
 const execFile = promisify(execFileCb);
+
+const wukongLogger = createLogger('WukongInput');
 
 const CLI_TIMEOUT_MS = 10_000;
 const TASK_BATCH_LIMIT = 50;
@@ -125,15 +128,63 @@ export class WukongInput extends BaseInput {
     try {
       await fsp.access(sockPath);
     } catch {
+      wukongLogger.debug('checkAvailability: daemon socket not found', { sockPath });
       return false;
     }
+    wukongLogger.debug('checkAvailability: daemon socket exists', { sockPath });
+
+    // Verify the Wukong process is actually running before spawning
+    // wukong-cli. Avoids unnecessary CLI spawns and timeouts when the app
+    // has been quit but the daemon socket file lingers.
+    if (!(await WukongInput.isProcessRunning())) {
+      wukongLogger.debug('checkAvailability: process not running');
+      return false;
+    }
+    wukongLogger.debug('checkAvailability: process running, checking CLI service status');
+
     try {
       const cliPath = WukongInput.getCliPath();
       const { stdout } = await execFile(cliPath, ['service', 'status'], {
         timeout: CLI_TIMEOUT_MS,
       });
-      return /running/i.test(stdout);
-    } catch {
+      const running = /running/i.test(stdout);
+      wukongLogger.debug('checkAvailability: CLI service status', { running, stdout: stdout.trim().slice(0, 200) });
+      return running;
+    } catch (err) {
+      wukongLogger.debug('checkAvailability: CLI service status failed', { error: String(err) });
+      return false;
+    }
+  }
+
+  /**
+   * Check whether the Wukong process is alive.
+   * macOS/Linux: pgrep -f to match command line.
+   * Windows: tasklist to filter by image name.
+   */
+  private static async isProcessRunning(): Promise<boolean> {
+    try {
+      if (process.platform === 'win32') {
+        // Windows: tasklist filters by image name, returns exit 0 regardless
+        // of whether a match was found, so we must inspect stdout.
+        const { stdout } = await execFile(
+          'tasklist',
+          ['/FI', 'IMAGENAME eq DingTalkReal.exe', '/NH'],
+          { timeout: 3000 },
+        );
+        return /DingTalkReal\.exe/i.test(stdout);
+      }
+      // macOS: match full app bundle path; Linux: match process name
+      const pattern = process.platform === 'darwin'
+        ? '/Wukong.app/Contents/MacOS/DingTalkReal'
+        : 'DingTalkReal';
+      await execFile('pgrep', ['-fl', pattern], { timeout: 3000 });
+      return true;
+    } catch (err) {
+      // pgrep/tasklist not available — cannot confirm, assume running (fall
+      // back to the socket + CLI service status check that follows)
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === 'ENOENT') return true;
+      // pgrep ran but no matching process found
       return false;
     }
   }
