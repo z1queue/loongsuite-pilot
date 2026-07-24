@@ -181,12 +181,8 @@ export class WukongInput extends BaseInput {
         : 'DingTalkReal';
       await execFile('pgrep', ['-fl', pattern], { timeout: 3000 });
       return true;
-    } catch (err) {
-      // pgrep/tasklist not available — cannot confirm, assume running (fall
-      // back to the socket + CLI service status check that follows)
-      const e = err as NodeJS.ErrnoException;
-      if (e.code === 'ENOENT') return true;
-      // pgrep ran but no matching process found
+    } catch {
+      // 任何异常都视为进程不存在
       return false;
     }
   }
@@ -266,6 +262,14 @@ export class WukongInput extends BaseInput {
   }
 
   private async doCollect(): Promise<AgentActivityEntry[]> {
+    // Pre-check: skip CLI call when the Wukong process is not running.
+    // wukong-cli has a daemon auto-start behavior that causes slow failures
+    // (tries to start daemon → DataManager not ready → fails after several seconds).
+    if (!(await WukongInput.isProcessRunning())) {
+      this.logger.debug('skip collect: wukong process not running');
+      return [];
+    }
+
     const state = this.stateStore.get(this.id);
     const seenCounts: Record<string, number> =
       (state.extra?.seenCounts != null && typeof state.extra.seenCounts === 'object')
